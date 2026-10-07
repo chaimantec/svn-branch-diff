@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+"""svn-branch-diff: show only the work done on an SVN branch.
+
+A branch that is kept up to date with "catch-up" merges from its parent
+(usually trunk) is hard to review with plain `svn diff`:
+
+    diff vs. the branch point -> also shows every trunk change merged in
+    diff vs. trunk HEAD       -> also shows newer trunk changes, reversed
+
+This tool diffs the branch against its parent *at the revision the branch was
+last synced to*. Code that came in through those merges is identical on both
+sides and cancels out, leaving only the branch's own changes (plus any merge
+conflict resolutions, which are branch work too).
+
+How the sync point is found: `svn mergeinfo --show-revs eligible PARENT BRANCH`
+lists the parent revisions not yet merged into the branch. The sync point is
+the parent revision just before the oldest of those, or the parent's latest
+revision when everything has been merged.
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
+from urllib.parse import quote, unquote
+
+
+class SvnError(Exception):
+    pass
+
+
+def svn(*args: str) -> str:
+    """Run svn and return its stdout. stderr is left on the terminal so that
+    svn's own error messages and authentication prompts are visible."""
+    cmd = ["svn", *args]
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE)
+    except FileNotFoundError:
+        raise SvnError("the 'svn' command was not found on PATH")
+    if proc.returncode != 0:
+        raise SvnError("command failed: " + " ".join(cmd))
+    return proc.stdout.decode("utf-8", errors="replace")
+
+
+def svn_xml(*args: str) -> ET.Element:
+    return ET.fromstring(svn(*args, "--xml"))
+
+
+def svn_info(target: str) -> ET.Element:
+    return svn_xml("info", target).find("entry")
+
+
+def is_url(target: str) -> bool:
+    return bool(re.match(r"^[a-z][a-z0-9+.-]*://", target, re.I)) or target.startswith("^/")
+
+
+def to_url(root: str, relpath: str) -> str:
+    return root + quote(relpath, safe="/")
+
+
+def to_relpath(root: str, url: str) -> str:
+    return unquote(url[len(root):]) or "/"
+
+
+def show(relpath: str) -> str:
+    return "^" + relpath
+
+
+def find_branch_origin(root: str, relpath: str, rev: int):
+    """Follow the branch's history back to the copy that created it.
+
+    Returns (parent_relpath, copied_from_rev, created_in_rev), or None when the
+    path was never copied (e.g. it *is* trunk). If the branch itself was later
+    renamed (copy + delete of the source in one commit) the rename is followed.
+    """
+    while True:
+        log = svn_xml("log", "-v", "--stop-on-copy", "-r", f"1:{rev}", "-l", "1",
+                      f"{to_url(root, relpath)}@{rev}")
+        entry = log.find("logentry")
+        if entry is None:
+            return None
+        paths = entry.findall("paths/path")
+        deleted = {p.text for p in paths if p.get("action") == "D"}
+        for p in paths:
+            src = p.get("copyfrom-path")
+            if src and (relpath == p.text or relpath.startswith(p.text.rstrip("/") + "/")):
+                src_relpath = src + relpath[len(p.text):]
+                src_rev = int(p.get("copyfrom-rev"))
+                if src in deleted:  # the branch was renamed: keep following
+                    relpath, rev = src_relpath, src_rev
+                    break
+                return src_relpath, src_rev, int(entry.get("revision"))
+        else:
+            return None
+
+
+def mergeinfo_revs(kind: str, source: str, target: str) -> list[int]:
+    out = svn("mergeinfo", "--show-revs", kind, source, target)
+    return sorted({int(r) for r in re.findall(r"^r(\d+)", out, re.M)})
+
+
+def format_revs(revs: list[int], limit: int = 8) -> str:
+    shown = ", ".join(f"r{r}" for r in revs[:limit])
+    return shown + (f", ... (+{len(revs) - limit} more)" if len(revs) > limit else "")
+
+
+PROP_BLOCK = re.compile(rb"^(?:Added|Modified|Deleted|Name): (.*?)\r?\n?$")
+FILE_HEADER = (b"Index: ", b"=====", b"diff --git ", b"--- ", b"+++ ")
+
+
+def diff_sections(stream):
+    """Split `svn diff` output into one list of lines per file."""
+    section: list[bytes] = []
+    for line in stream:
+        if line.startswith(b"Index: ") and section:
+            yield section
+            section = []
+        section.append(line)
+    if section:
+        yield section
+
+
+def strip_mergeinfo(section: list[bytes]) -> list[bytes]:
+    """Drop svn:mergeinfo property changes (merge bookkeeping, not code) from
+    one file's diff, and the whole section if nothing else is left."""
+    start = next((i for i, l in enumerate(section)
+                  if l.startswith(b"Property changes on: ")), None)
+    if start is None:
+        return section
+    kept, keep = [], True
+    for line in section[start + 2:]:  # skip the header and its underline
+        m = PROP_BLOCK.match(line)
+        if m:
+            keep = m.group(1).strip() != b"svn:mergeinfo"
+        if keep:
+            kept.append(line)
+    if kept:
+        return section[:start + 2] + kept
+    head = section[:start]
+    while head and head[-1] in (b"\n", b"\r\n"):
+        head.pop()
+    if all(l.startswith(FILE_HEADER) for l in head):
+        return []
+    return head
+
+
+def colorize(line: bytes, state: dict) -> bytes:
+    def paint(code: bytes) -> bytes:
+        return code + line.rstrip(b"\r\n") + b"\033[0m\n"
+
+    if line.startswith((b"Index: ", b"diff --git ")):
+        state["in_hunk"] = False
+    if line.startswith(b"Property changes on: "):
+        state["in_hunk"] = True
+        return paint(b"\033[1m")
+    if line.startswith((b"@@", b"## ")):
+        state["in_hunk"] = True
+        return paint(b"\033[36m")
+    if not state["in_hunk"]:
+        return paint(b"\033[1m")
+    if line.startswith(b"+"):
+        return paint(b"\033[32m")
+    if line.startswith(b"-"):
+        return paint(b"\033[31m")
+    return line
+
+
+def run_diff(old: str, new: str, extra: list[str], color: bool, show_mergeinfo: bool) -> int:
+    proc = subprocess.Popen(["svn", "diff", f"--old={old}", f"--new={new}", *extra],
+                            stdout=subprocess.PIPE)
+    out = sys.stdout.buffer
+    state = {"in_hunk": False}
+    for section in diff_sections(proc.stdout):
+        if not show_mergeinfo:
+            section = strip_mergeinfo(section)
+        for line in section:
+            out.write(colorize(line, state) if color else line)
+    out.flush()
+    return proc.wait()
+
+
+def props_except_mergeinfo(url: str) -> dict:
+    root = svn_xml("proplist", "-v", url)
+    return {p.get("name"): p.text for p in root.iter("property")
+            if p.get("name") != "svn:mergeinfo"}
+
+
+def run_summarize(old: str, new: str, extra: list[str], show_mergeinfo: bool) -> None:
+    root = svn_xml("diff", "--summarize", f"--old={old}", f"--new={new}", *extra)
+    codes = {"added": "A", "deleted": "D", "modified": "M", "replaced": "R"}
+    old_base, old_rev = old.rsplit("@", 1)
+    new_base, new_rev = new.rsplit("@", 1)
+    rows = []
+    for p in root.iter("path"):
+        # Paths are reported as URLs under the old side.
+        rel = (p.text or "")[len(old_base):].lstrip("/")
+        item = p.get("item")
+        props_changed = p.get("props") == "modified"
+        if props_changed and not show_mergeinfo:
+            sub = "/" + rel if rel else ""
+            old_props = {} if item == "added" else \
+                props_except_mergeinfo(f"{old_base}{sub}@{old_rev}")
+            new_props = {} if item == "deleted" else \
+                props_except_mergeinfo(f"{new_base}{sub}@{new_rev}")
+            props_changed = old_props != new_props
+        if item not in codes and not props_changed:
+            continue
+        rows.append((unquote(rel) or ".", codes.get(item, " ") + ("M" if props_changed else " ")))
+    for path, status in sorted(rows):
+        print(f"{status}  {path}")
+
+
+def run_log(branch_url: str, rev: int, created_rev: int) -> None:
+    log = svn_xml("log", "-g", "-r", f"{rev}:{created_rev}", f"{branch_url}@{rev}")
+    merges = []
+    for entry in log.findall("logentry"):
+        r = int(entry.get("revision"))
+        if entry.find("logentry") is not None:  # has merged children: a merge commit
+            merges.append(r)
+            continue
+        author = entry.findtext("author") or "(no author)"
+        date = (entry.findtext("date") or "")[:16].replace("T", " ")
+        msg = (entry.findtext("msg") or "").strip().splitlines()
+        note = "  (branch created)" if r == created_rev else ""
+        print(f"r{r:<7} {author:<12} {date}  {msg[0] if msg else ''}{note}")
+    if merges:
+        print(f"\nSkipped {len(merges)} merge commit(s): {format_revs(sorted(merges))}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="svn-branch-diff",
+        usage="%(prog)s [options] [BRANCH] [-- SVN_DIFF_ARGS...]",
+        description="Show the changes made on an SVN branch, excluding code that "
+                    "was merged in from its parent (e.g. trunk sync merges).",
+        epilog="Anything after -- is passed to 'svn diff', e.g.\n"
+               "  %(prog)s -- -x -w            ignore whitespace\n"
+               "  %(prog)s -- --git            git-style diff\n"
+               "  %(prog)s -- src/main.c       limit to a path inside the branch\n"
+               "\nExamples:\n"
+               "  %(prog)s                                 working copy in the current dir\n"
+               "  %(prog)s ^/branches/feature-x\n"
+               "  %(prog)s https://svn.example.com/repo/branches/feature-x --summarize\n"
+               "  %(prog)s --log                           list the branch's own commits",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("branch", nargs="?", default=".", metavar="BRANCH",
+                   help="branch working copy path or URL (default: .)")
+    p.add_argument("-r", "--revision", metavar="REV",
+                   help="branch revision to inspect (default: HEAD)")
+    p.add_argument("--parent", metavar="URL",
+                   help="parent to compare against, as a URL or ^/path "
+                        "(default: where the branch was copied from)")
+    p.add_argument("--base-rev", type=int, metavar="REV",
+                   help="parent revision to compare against (default: the last synced revision)")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("-s", "--summarize", action="store_true",
+                      help="list changed files instead of the full diff")
+    mode.add_argument("--log", action="store_true",
+                      help="list the branch's own commits, skipping merge commits")
+    p.add_argument("--show-mergeinfo", action="store_true",
+                   help="keep svn:mergeinfo property changes (hidden by default)")
+    p.add_argument("--color", choices=["auto", "always", "never"], default="auto",
+                   help="colorize the diff (default: auto)")
+    p.add_argument("-q", "--quiet", action="store_true",
+                   help="don't print the summary header (on stderr)")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    extra: list[str] = []
+    if "--" in argv:
+        i = argv.index("--")
+        argv, extra = argv[:i], argv[i + 1:]
+    args = build_parser().parse_args(argv)
+
+    def note(msg: str = "") -> None:
+        if not args.quiet:
+            print(msg, file=sys.stderr)
+
+    # Resolve the branch to a URL and a concrete revision number. A URL may carry
+    # a peg (URL@1234), e.g. for a branch that has since been deleted. Asking for
+    # an older -r follows renames, so the URL is whatever the branch was called then.
+    target = args.branch
+    if is_url(target):
+        peg = re.search(r"@(\d+|HEAD|\{[^}]*\})$", target)
+        rev_spec = args.revision or (peg.group(1) if peg else "HEAD")
+    else:
+        rev_spec = args.revision or "HEAD"
+        if "@" in target:
+            target += "@"  # escape '@' in local paths
+        target = svn_info(target).findtext("url")
+    entry = svn_xml("info", "-r", rev_spec, target).find("entry")
+    root = entry.findtext("repository/root")
+    branch_url = entry.findtext("url")
+    rev = int(entry.get("revision"))
+    branch_rel = to_relpath(root, branch_url)
+
+    origin = find_branch_origin(root, branch_rel, rev)
+    if args.parent:
+        parent_url = (to_url(root, args.parent[1:]) if args.parent.startswith("^/")
+                      else args.parent.rstrip("/"))
+    elif origin:
+        parent_url = to_url(root, origin[0])
+    else:
+        raise SvnError(f"{show(branch_rel)} was not copied from anywhere, so its parent "
+                       "can't be detected. Pass --parent URL.")
+    parent_rel = to_relpath(root, parent_url) if parent_url.startswith(root) else parent_url
+
+    if args.log:
+        if not origin:
+            raise SvnError("can't find where the branch was created, so --log can't run.")
+        note(f"Branch : {show(branch_rel)} @ r{rev}  (created in r{origin[2]})\n")
+        run_log(branch_url, rev, origin[2])
+        return 0
+
+    note(f"Branch : {show(branch_rel)} @ r{rev}")
+    note(f"Parent : {show(parent_rel)}"
+         + (f"  (branched from r{origin[1]} in r{origin[2]})" if origin and not args.parent else ""))
+
+    if args.base_rev is not None:
+        base = args.base_rev
+        note(f"Base   : r{base}  (from --base-rev)")
+    else:
+        parent_peg, branch_peg = f"{parent_url}@{rev}", f"{branch_url}@{rev}"
+        eligible = mergeinfo_revs("eligible", parent_peg, branch_peg)
+        if eligible:
+            base = eligible[0] - 1
+        else:
+            base = int(svn_info(parent_peg).find("commit").get("revision"))
+        note(f"Synced : parent is fully merged into the branch up to r{base}")
+        if eligible:
+            note(f"         {len(eligible)} newer parent revision(s) not merged yet, "
+                 f"ignored: {format_revs(eligible)}")
+        picked = [r for r in mergeinfo_revs("merged", parent_peg, branch_peg) if r > base]
+        if picked:
+            note(f"Note   : {format_revs(picked)} cherry-picked from the parent past the "
+                 "sync point; those changes will appear in the diff.")
+
+    old, new = f"{parent_url}@{base}", f"{branch_url}@{rev}"
+    note(f"Diff   : {show(parent_rel)}@{base}  ->  {show(branch_rel)}@{rev}")
+    note()
+    sys.stderr.flush()
+
+    if args.summarize:
+        run_summarize(old, new, extra, args.show_mergeinfo)
+        return 0
+    color = args.color == "always" or (args.color == "auto" and sys.stdout.isatty())
+    return run_diff(old, new, extra, color, args.show_mergeinfo)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except SvnError as e:
+        print(f"svn-branch-diff: {e}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        sys.exit(0)
